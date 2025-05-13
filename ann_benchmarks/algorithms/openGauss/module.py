@@ -36,6 +36,7 @@ from ...util import get_bool_env_var
 import multiprocessing
 from multiprocessing import Pool
 import numpy
+import time
 
 def get_pg_param_env_var_name(pg_param_name: str) -> str:
     return f'ANN_BENCHMARKS_OG_{pg_param_name.upper()}'
@@ -118,6 +119,7 @@ class openGaussHNSW(BaseANN):
             for i, embedding in enumerate(X):
                 copy.write_row((i, embedding))
         print("creating index...")
+
         if self._metric == "angular":
             cur.execute(
                 "CREATE INDEX ON items USING hnsw (embedding vector_cosine_ops) WITH (m = %d, ef_construction = %d)" % (self._m, self._ef_construction)
@@ -132,7 +134,7 @@ class openGaussHNSW(BaseANN):
 
     def set_query_arguments(self, ef_search):
         self._ef_search = ef_search
-        self._cur.execute("SET hnsw.ef_search = %d" % ef_search)
+        self._cur.execute("SET hnsw_ef_search = %d" % ef_search)
         self._cur.execute("set enable_seqscan = off")
         conc = self.con
         self.search_pool = Pool(conc, initializer=self.init_connection)
@@ -157,6 +159,8 @@ class openGaussHNSW(BaseANN):
         cur.execute("set enable_seqscan = off")
         global base_query
         base_query = self._query
+        self.connections.append(conn)
+        self.curs.append(cur)
 
     def close_connections(self):
         for cur in self.curs:
@@ -304,6 +308,8 @@ class openGaussHNSWPQ(BaseANN):
         cur.execute("set hnsw_earlystop_threshold = %d" % self.hnsw_earlystop_threshold)
         global base_query
         base_query = self._query
+        self.connections.append(conn)
+        self.curs.append(cur)
 
     def close_connections(self):
         for cur in self.curs:
@@ -346,10 +352,17 @@ class openGaussHNSWPQ(BaseANN):
 
 
 class openGaussIVF(BaseANN):
-    def __init__(self, metric, lists):
+    def __init__(self, metric, params, lists):
         self._metric = metric
         self._lists = lists
         self._cur = None
+        self.curs = []
+        self.connections = []
+        self.init_conn_flags = False
+        self.search_pool = None
+
+        self.enable_npu = params[0]["enable_npu"]
+        self.conc = params[1]["concurrents"]
 
         # default value
         self.user = 'ann'
@@ -406,6 +419,7 @@ class openGaussIVF(BaseANN):
             for i, embedding in enumerate(X):
                 copy.write_row((i, embedding))
         print(f"creating index ...")
+        start_time = time.perf_counter()
         if self._metric == "angular":
             cur.execute(
                 "CREATE INDEX ON items USING ivfflat (embedding vector_cosine_ops) WITH (lists = %d)" % (self._lists))
@@ -413,13 +427,17 @@ class openGaussIVF(BaseANN):
             cur.execute("CREATE INDEX ON items USING ivfflat (embedding vector_l2_ops) WITH (lists= %d)" % (self._lists))
         else:
             raise RuntimeError(f"unknown metric {self._metric}")
-        print("done!")
+        end_time = time.perf_counter() - start_time
+        print(f"done! time = {end_time}.")
         self._cur = cur
 
     def set_query_arguments(self, probes):
         self._probes = probes
         self._cur.execute("SET ivfflat_probes = %d" % probes)
         self._cur.execute("set enable_seqscan = off")
+        self._cur.execute("set enable_npu = %s" % self.enable_npu)
+        conc = self.conc
+        self.search_pool = Pool(conc, initializer=self.init_connection)
 
     def query(self, v, n):
         self._cur.execute(self._query, (v, n), binary=True, prepare=True)
@@ -430,6 +448,56 @@ class openGaussIVF(BaseANN):
             return 0
         self._cur.execute("SELECT pg_relation_size('items_embedding_idx')")
         return self._cur.fetchone()[0] / 1024
+    
+    def init_connection(self):
+        conn = psycopg.connect(user=self.user, password=self.password, dbname=self.dbname, host=self.host, autocommit=True, port=self.port)
+        pgvector.psycopg.register_vector(conn)
+        global cur
+        cur = conn.cursor()
+        cur.execute("SET ivfflat_probes = %d" % self._probes)
+        cur.execute("set enable_seqscan = off")
+        cur.execute("set enable_npu = %s" % self.enable_npu)
+        global base_query
+        base_query = self._query
+        self.connections.append(conn)
+        self.curs.append(cur)
+
+    def close_connections(self):
+        for cur in self.curs:
+            if cur is not None:
+                cur.close()
+                cur = None
+        for conn in self.connections:
+            if conn is not None:
+                conn.close()
+                conn = None
+        self.curs = []
+        self.connections = []
+        self.init_conn_flags = False
+    
+    @staticmethod
+    def sub_query(chunk, n):
+        ids = []
+        for item in chunk:
+            cur.execute(base_query, (item, n), binary=True, prepare=True)
+            res = cur.fetchall()
+            ids.append([i[0] for i in res])
+        return ids
+    
+    def batch_query(self, X: numpy.array, n: int):
+        conc = self.conc
+        chunk_size = len(X) // conc + 1
+        chunks = [X[i:i + chunk_size] for i in range(0, len(X), chunk_size)]
+        res = self.search_pool.starmap(self.sub_query, [(chunk, n) for chunk in chunks])
+        print(f"openGauss concuiiency_query process num: {conc}")
+        self.res = []
+        for item in res:
+            for ids in item:
+                self.res.append(ids)
+
 
     def __str__(self):
         return f"openGaussIVF(lists={self._lists}, probes={self._probes})"
+
+    def __del__(self):
+        self.close_connections()

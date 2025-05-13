@@ -38,5 +38,5 @@ float:
     name: openGauss-ivfflat
     run_groups:
       pgvector:
-        args: [[100, 200, 400, 1000, 2000, 4000]]
+        args: [[[enable_npu: "off", concurrents: 80]], [100, 200, 400, 1000, 2000, 4000]]
         query_args: [[1, 2, 4, 10, 20, 40, 100]]
