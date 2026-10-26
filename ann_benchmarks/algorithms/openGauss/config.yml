@@ -40,3 +40,33 @@ float:
       pgvector:
         args: [[[enable_npu: "off", concurrents: 80]], [100, 200, 400, 1000, 2000, 4000]]
         query_args: [[1, 2, 4, 10, 20, 40, 100]]
+  - base_args: ['@metric']
+    constructor: OpenGaussHNSWRaBitQ
+    disabled: false
+    docker_tag: ann-benchmarks-openGauss
+    module: ann_benchmarks.algorithms.openGauss
+    name: openGauss-hnsw-rabitq
+    run_groups:
+      m-16:
+        arg_groups: [{m: 16, ef_construction: 100, rabitq_refine_type: NONE, rabitq_fht: false, concurrents: 1}]
+        query_arg_groups: [{hnsw_ef_search: [40, 100], rbq_query_bits: 8, rbq_refinek: 0.0}]
+  - base_args: ['@metric']
+    constructor: OpenGaussIVFFlatRaBitQ
+    disabled: false
+    docker_tag: ann-benchmarks-openGauss
+    module: ann_benchmarks.algorithms.openGauss
+    name: openGauss-ivfflat-rabitq
+    run_groups:
+      lists-100:
+        arg_groups: [{lists: 100, rabitq_refine_type: NONE, rabitq_fht: false, concurrents: 1}]
+        query_arg_groups: [{ivfflat_probes: [1, 10], rbq_query_bits: 8, rbq_refinek: 0.0}]
+  - base_args: ['@metric']
+    constructor: OpenGaussDiskANN
+    disabled: false
+    docker_tag: ann-benchmarks-openGauss
+    module: ann_benchmarks.algorithms.openGauss
+    name: openGauss-diskann
+    run_groups:
+      index-32:
+        arg_groups: [{index_size: 32, concurrents: 1, statement_timeout_ms: 3600000}]
+        query_arg_groups: [{diskann_probes: [64, 128]}]

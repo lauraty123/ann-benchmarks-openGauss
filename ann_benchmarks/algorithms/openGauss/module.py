@@ -20,13 +20,25 @@ to "false" (or e.g. "0" or "no") in order to disable this behavior.
 
 This module will also attempt to create the pgvector extension inside the
 target database, if it has not been already created.
+
+The DiskANN and RaBitQ adapters below use an externally managed openGauss
+instance. They do not start a service or create an extension.
 """
+import json
+import math
+import re
 import subprocess
 import sys
 import os
+import uuid
+import warnings
+from contextlib import contextmanager
+from numbers import Integral, Real
+from threading import Condition
 
 import pgvector.psycopg
 import psycopg
+from psycopg import sql
 
 from typing import Dict, Any, Optional
 
@@ -36,6 +48,7 @@ from ...util import get_bool_env_var
 import multiprocessing
 from multiprocessing import Pool
 import numpy
+import numpy as np
 import time
 
 def get_pg_param_env_var_name(pg_param_name: str) -> str:
@@ -199,6 +212,502 @@ class openGaussHNSW(BaseANN):
 
     def __del__(self):
         self.close_connections()
+
+# Database-side vector indexes through the existing BaseANN runner interface.
+# Only tables created by these adapters are dropped during cleanup.
+
+def integer(name, value, lower, upper):
+    if isinstance(value, bool) or not isinstance(value, Integral) or not lower <= value <= upper:
+        raise ValueError(f"{name} must be an integer in [{lower}, {upper}]")
+    return int(value)
+
+
+def real(name, value, lower, upper):
+    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number in [{lower}, {upper}]")
+    if not lower <= value <= upper:
+        raise ValueError(f"{name} must be in [{lower}, {upper}]")
+    return float(value)
+
+
+def boolean(name, value):
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a YAML/JSON boolean, not a string")
+    return value
+
+
+class _QueryConnections:
+    """Database sessions for BaseANN's existing batch-query workers.
+
+    BaseANN owns task scheduling, result ordering and batching; the runner owns
+    timing. Its default ThreadPool has no connection initializer or configurable
+    worker count, so this session manager only limits active database queries to
+    ``concurrents`` and gives each query exclusive use of an initialized session.
+    Actual parallelism is also bounded by the framework's worker count.
+    The adapter exposes this as ``search_pool`` for the existing runner's
+    close() hook. Connections are closed after the framework's workers finish.
+    """
+
+    def __init__(self, adapter):
+        self.adapter = adapter
+        self.connections = []
+        self.available = []
+        self._condition = Condition()
+        self._closed = False
+
+    def prepare(self):
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("query connections are closed; call set_query_arguments() before querying again")
+            if self.connections:
+                return
+            try:
+                for _ in range(self.adapter.params["concurrents"]):
+                    connection = self.adapter._connect()
+                    self.connections.append(connection)
+                    self.adapter._apply_settings(connection, self.adapter.query_params)
+            except BaseException:
+                for connection in self.connections:
+                    connection.close()
+                self.connections = []
+                raise
+            self.available = list(self.connections)
+
+    @contextmanager
+    def connection(self):
+        self.prepare()
+        with self._condition:
+            while not self.available and not self._closed:
+                self._condition.wait()
+            if self._closed:
+                raise RuntimeError("query connections are closed")
+            connection = self.available.pop()
+        try:
+            yield connection
+        finally:
+            with self._condition:
+                self.available.append(connection)
+                self._condition.notify_all()
+
+    def close(self):
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+            # Also handle runner cleanup after an interrupted batch: reject new
+            # leases and let in-flight queries return before closing sessions.
+            while len(self.available) < len(self.connections):
+                self._condition.wait()
+            for connection in self.connections:
+                connection.close()
+            self.connections = []
+            self.available = []
+
+
+class OpenGaussANN(BaseANN):
+    method = None
+    defaults = {}
+    query_defaults = {}
+    max_dimension = 2000
+
+    def __init__(self, metric, method_param):
+        if metric not in ("euclidean", "angular"):
+            raise ValueError("Only euclidean (L2) and angular (cosine) float vectors are supported")
+        if not isinstance(method_param, dict):
+            raise ValueError("build parameters must be a mapping")
+        self.metric = metric
+        common = {
+            "concurrents": 1, "parallel_workers": 1, "schema": "public",
+            "enable_opfusion": None, "enable_seqscan": False,
+            "statement_timeout_ms": 300000, "lock_timeout_ms": 5000,
+            "maintenance_work_mem_mb": None,
+        }
+        unknown = set(method_param) - set(common) - set(self.defaults)
+        if unknown:
+            raise ValueError(f"Unknown build parameter(s): {sorted(unknown)}")
+        self.params = {**common, **self.defaults, **method_param}
+        for name, lo, hi in (("concurrents", 1, 256), ("parallel_workers", 1, 128),
+                             ("statement_timeout_ms", 1, 2147483647), ("lock_timeout_ms", 1, 2147483647)):
+            self.params[name] = integer(name, self.params[name], lo, hi)
+        if self.params["maintenance_work_mem_mb"] is not None:
+            self.params["maintenance_work_mem_mb"] = integer(
+                "maintenance_work_mem_mb", self.params["maintenance_work_mem_mb"], 1, 2097151)
+        schema = self.params["schema"]
+        if not isinstance(schema, str) or not schema or "\x00" in schema or len(schema.encode()) > 63:
+            raise ValueError("schema must be a nonempty SQL identifier of at most 63 bytes")
+        boolean("enable_seqscan", self.params["enable_seqscan"])
+        if self.params["enable_opfusion"] is not None:
+            boolean("enable_opfusion", self.params["enable_opfusion"])
+        self._validate_build()
+        self.query_params = self.normalize_query_arguments({})
+        self.connection = None
+        self._created = False
+        self.table_name = "annb_" + uuid.uuid4().hex
+        self.index_name = self.table_name + "_idx"
+        self.table = sql.Identifier(schema, self.table_name)
+        self.index = sql.Identifier(schema, self.index_name)
+        self.operator, self.opclass = ("<->", "vector_l2_ops") if metric == "euclidean" else ("<=>", "vector_cosine_ops")
+        self.query_sql = sql.SQL("SELECT id FROM {} ORDER BY embedding {} %s::vector LIMIT %s").format(
+            self.table, sql.SQL(self.operator))
+        self.search_pool = _QueryConnections(self)
+        self.res = []
+        self._metadata = {}
+        self._reported_server_risks = set()
+        self._dimension = None
+        self._count = None
+        self._probe = None
+
+    def _validate_build(self):
+        raise NotImplementedError
+
+    def _index_options(self):
+        raise NotImplementedError
+
+    def _validate_query(self, params):
+        raise NotImplementedError
+
+    def _connect(self):
+        kwargs = {"autocommit": True, "connect_timeout": 10, "application_name": "annbenchmark-opengauss"}
+        for name in ("user", "password", "dbname", "host", "port"):
+            # Match the existing openGauss adapters' connection defaults.
+            value = get_pg_conn_param(name, "ann" if name in ("user", "password", "dbname") else None)
+            if value is not None:
+                kwargs[name] = int(value) if name == "port" else value
+        connection = psycopg.connect(**kwargs)
+        try:
+            pgvector.psycopg.register_vector(connection)
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
+    def _apply_settings(self, connection, query_params):
+        settings = {
+            "statement_timeout": self.params["statement_timeout_ms"],
+            "lockwait_timeout": self.params["lock_timeout_ms"],
+            "enable_seqscan": self.params["enable_seqscan"],
+            **query_params,
+        }
+        if self.params["enable_opfusion"] is not None:
+            settings["enable_opfusion"] = self.params["enable_opfusion"]
+        if self.params["maintenance_work_mem_mb"] is not None:
+            settings["maintenance_work_mem"] = f"{self.params['maintenance_work_mem_mb']}MB"
+        with connection.cursor() as cur:
+            for name, value in settings.items():
+                cur.execute(sql.SQL("SET {} = {}").format(sql.Identifier(name), sql.Literal(value)))
+
+    def _validate_matrix(self, data, fitting=False):
+        raw = np.asarray(data)
+        if raw.dtype.kind not in "fiu" or raw.ndim != 2:
+            raise ValueError("vectors must be a two-dimensional numeric array")
+        with np.errstate(over="ignore", invalid="ignore"):
+            matrix = np.asarray(raw, dtype=np.float32)
+        if not np.isfinite(matrix).all():
+            raise ValueError("vectors must be finite and representable as float32")
+        if fitting:
+            if not 1 <= len(matrix) <= 2147483647 or not 1 <= matrix.shape[1] <= self.max_dimension:
+                raise ValueError(f"nonempty vector data with dimensions 1..{self.max_dimension} required")
+            if self.metric == "angular" and matrix.shape[1] < 2:
+                raise ValueError("cosine indexes require at least two dimensions")
+            if self.method == "ivfflat" and self.params["lists"] > len(matrix):
+                raise ValueError("lists must not exceed the number of input vectors")
+            if self.method == "diskann" and self.params["enable_pq"] and matrix.shape[1] % self.params["pq_m"]:
+                raise ValueError("vector dimension must be divisible by pq_m")
+        elif matrix.shape[1] != self._dimension:
+            raise ValueError(f"query dimension must be {self._dimension}")
+        if self.metric == "angular" and np.any(~np.any(matrix != 0, axis=1)):
+            raise ValueError("cosine vectors must be nonzero (zero vectors are not indexed)")
+        return matrix
+
+    def _require_fitted(self):
+        if self.connection is None or self.connection.closed or not self._created:
+            raise RuntimeError("fit() must complete before querying")
+
+    def fit(self, X):
+        if self.connection is not None or self._created:
+            raise RuntimeError("call done() before fitting this adapter again")
+        matrix = self._validate_matrix(X, fitting=True)
+        self._metadata = {}
+        self._reported_server_risks.clear()
+        self.search_pool = _QueryConnections(self)
+        self.res = []
+        self._dimension, self._count = matrix.shape[1], len(matrix)
+        self._probe = matrix[0].copy()
+        try:
+            self.connection = self._connect()
+            self._apply_settings(self.connection, self.query_params)
+            start = time.perf_counter()
+            with self.connection.cursor() as cur:
+                cur.execute(sql.SQL("CREATE TABLE {} (id integer NOT NULL, embedding vector({}))").format(
+                    self.table, sql.Literal(self._dimension)))
+                self._created = True
+                cur.execute(sql.SQL("ALTER TABLE {} ALTER COLUMN embedding SET STORAGE PLAIN").format(self.table))
+                cur.execute(sql.SQL("ALTER TABLE {} SET (parallel_workers = {})").format(
+                    self.table, sql.Literal(self.params["parallel_workers"])))
+                # Ordinary, committed rows are visible to DiskANN's build workers.
+                with cur.copy(sql.SQL("COPY {} (id, embedding) FROM STDIN").format(self.table)) as copy:
+                    for i, vector in enumerate(matrix):
+                        copy.write_row((i, vector))
+                self._metadata["data_load_time_s"] = time.perf_counter() - start
+                options = sql.SQL(", ").join(sql.SQL("{} = {}").format(sql.Identifier(k), sql.Literal(v))
+                                           for k, v in self._index_options().items())
+                create = sql.SQL("CREATE INDEX {} ON {} USING {} (embedding {}) WITH ({})").format(
+                    sql.Identifier(self.index_name), self.table, sql.Identifier(self.method),
+                    sql.Identifier(self.opclass), options)
+                start = time.perf_counter()
+                cur.execute(create)
+                self._metadata["index_build_time_s"] = time.perf_counter() - start
+                cur.execute(sql.SQL("ANALYZE {}").format(self.table))
+                cur.execute("SELECT version()")
+                self._metadata["database_version"] = cur.fetchone()[0]
+                cur.execute("SELECT current_database(), current_user")
+                database, user = cur.fetchone()
+                self._metadata.update(database_name=database, database_user=user,
+                                      vector_dimension=self._dimension, vector_count=self._count,
+                                      vector_type="vector", adapter_version="0.2.2")
+            self._record_settings()
+            self._record_known_server_risks()
+            self.explain(self._probe, min(10, self._count))
+        except BaseException:
+            try:
+                self.done()
+            except Exception as cleanup_error:
+                warnings.warn(f"Cleanup after fit failure also failed: {type(cleanup_error).__name__}", RuntimeWarning)
+            raise
+
+    def _record_settings(self):
+        names = list(self.query_params) + ["enable_seqscan", "enable_opfusion", "statement_timeout", "lockwait_timeout",
+                                          "maintenance_work_mem", "work_mem", "shared_buffers", "max_process_memory"]
+        with self.connection.cursor() as cur:
+            cur.execute("SELECT name, setting, unit FROM pg_settings WHERE name = ANY(%s) ORDER BY name", (names,))
+            rows = cur.fetchall()
+            self._metadata["effective_settings_json"] = json.dumps({r[0]: r[1] for r in rows}, sort_keys=True)
+            self._metadata["effective_setting_units_json"] = json.dumps({r[0]: r[2] for r in rows}, sort_keys=True)
+
+    def _record_known_server_risks(self):
+        """Disclose known build/path risks without changing requested semantics.
+
+        Build labels cannot establish whether a downstream kernel has a fix.
+        An empty list is not a certificate that other builds/paths are correct.
+        """
+        version = self._metadata.get("database_version", "")
+        risks = {}
+        if re.search(r"\bbuild (2397a86f|e024ee66)\b", version):
+            refine = self.params.get("rabitq_refine_type")
+            if refine in ("FP32", "SQ8") and self.query_params.get("rbq_refinek", 0) > 0:
+                if self.method == "ivfflat":
+                    risks["ivf-rabitq-refinement"] = (
+                        "Official openGauss 7.0.0 IVF RaBitQ FP32 refinement failed with "
+                        "'The tuple is not found' in independent gsql reproduction. "
+                        "SQ8 also uses the rerank path; its successful samples do not prove stability.")
+                elif self.method == "hnsw" and self.metric == "angular":
+                    risks["hnsw-rabitq-cosine-refinement"] = (
+                        "Official openGauss 7.0.0 HNSW RaBitQ FP32 cosine refinement returned "
+                        "incorrect candidate order in independent gsql reproduction. "
+                        "SQ8 shares the source scoring branch; that is a source-level risk, "
+                        "not a claim of an independently reproduced SQ8 failure.")
+        self._metadata["known_server_risks_json"] = json.dumps(sorted(risks))
+        for key, message in risks.items():
+            if key not in self._reported_server_risks:
+                warnings.warn(message + " Check whether your server includes a fix; requested "
+                              "parameters and returned order are unchanged.",
+                              RuntimeWarning, stacklevel=2)
+                self._reported_server_risks.add(key)
+
+    def set_query_arguments(self, *args):
+        """Accept a mapping, or ordered positional values matching query_defaults."""
+        self._require_fitted()
+        if len(args) == 1 and isinstance(args[0], dict):
+            supplied = args[0]
+        else:
+            if len(args) != len(self.query_defaults):
+                raise ValueError(f"query parameters must be {list(self.query_defaults)} or one mapping")
+            supplied = dict(zip(self.query_defaults, args))
+        params = self.normalize_query_arguments(supplied)
+        self.search_pool.close()
+        self._apply_settings(self.connection, params)
+        self.query_params = params
+        self.search_pool = _QueryConnections(self)
+        self.res = []
+        self._record_settings()
+        self._record_known_server_risks()
+        self.explain(self._probe, min(10, self._count))
+        # Like the existing openGauss adapters, initialize query sessions when
+        # switching parameter groups, before the runner starts timing queries.
+        self.search_pool.prepare()
+
+    def normalize_query_arguments(self, supplied):
+        """Pure validation shared by CLI preflight and live parameter switching."""
+        if not isinstance(supplied, dict):
+            raise ValueError("query parameters must be a mapping")
+        unknown = set(supplied) - set(self.query_defaults)
+        if unknown:
+            raise ValueError(f"Unknown query parameter(s): {sorted(unknown)}")
+        defaults = dict(self.query_defaults)
+        if self.method == "ivfflat":
+            defaults["ivfflat_probes"] = min(defaults["ivfflat_probes"], self.params["lists"])
+        params = {**defaults, **supplied}  # reset omitted values, never inherit the prior group
+        self._validate_query(params)
+        return params
+
+    def _query_vector(self, v, n):
+        self._require_fitted()
+        n = integer("k", n, 1, self._count)
+        raw = np.asarray(v)
+        if raw.ndim != 1:
+            raise ValueError("query must be a one-dimensional vector")
+        matrix = self._validate_matrix(raw.reshape(1, -1))
+        return matrix[0], n
+
+    def _execute_query(self, connection, vector, n):
+        with connection.cursor() as cur:
+            cur.execute(self.query_sql, (vector, n), binary=True, prepare=True)
+            ids = [row[0] for row in cur.fetchall()]
+        # ANN searches can return fewer than k candidates at small search budgets.
+        # The reference runner pads these with -1/+inf and reduces recall.
+        # The driver decodes the integer column; the runner handles result ID
+        # conversion and uniqueness outside query timing. Keep these guards:
+        # its single path only warns on excess results, and its batch path has
+        # no equivalent count check; negative IDs would index from the end.
+        if len(ids) > n or any(i < 0 or i >= self._count for i in ids):
+            raise RuntimeError("index query returned too many or out-of-range IDs")
+        return ids
+
+    def query(self, v, n):
+        vector, n = self._query_vector(v, n)
+        with self.search_pool.connection() as connection:
+            return self._execute_query(connection, vector, n)
+
+    def explain(self, v, n):
+        vector, n = self._query_vector(v, n)
+        with self.connection.cursor() as cur:
+            cur.execute(sql.SQL("EXPLAIN ") + self.query_sql, (vector, n), prepare=False)
+            plan = "\n".join(str(row[0]) for row in cur.fetchall())
+        if self.index_name not in plan or "Index Scan" not in plan:
+            raise RuntimeError(f"planner did not select the benchmark index: {plan}")
+        self._metadata["query_plan"] = plan
+        return plan
+
+    def get_memory_usage(self):
+        """Reference hook is in KiB; this is index storage, NOT process memory."""
+        if not self._created or self.connection is None or self.connection.closed:
+            return 0.0
+        with self.connection.cursor() as cur:
+            cur.execute("SELECT pg_relation_size(%s::regclass)", (self.index.as_string(self.connection),))
+            return int(cur.fetchone()[0]) / 1024.0
+
+    def get_additional(self):
+        return {**self._metadata,
+                "build_params_json": json.dumps(self.params, sort_keys=True),
+                "query_params_json": json.dumps(self.query_params, sort_keys=True),
+                "metric": self.metric, "index_method": self.method,
+                "index_size_bytes": int(self.get_memory_usage() * 1024),
+                "latency_definition": "runner wall time: per query in single mode; per batch / query count in batch mode",
+                "index_size_definition": "pg_relation_size of benchmark index, not peak memory"}
+
+    def done(self):
+        self.search_pool.close()
+        cleanup_error = None
+        try:
+            if self._created:
+                if self.connection is None or self.connection.closed or self.connection.broken:
+                    if self.connection is not None:
+                        self.connection.close()
+                    self.connection = self._connect()
+                    self._apply_settings(self.connection, self.query_params)
+                with self.connection.cursor() as cur:
+                    cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(self.table))
+                self._created = False
+        except Exception as exc:
+            cleanup_error = exc
+        finally:
+            if self.connection is not None:
+                self.connection.close()
+                self.connection = None
+        if cleanup_error is not None:
+            raise RuntimeError(f"Could not clean owned table {self.params['schema']}.{self.table_name}") from cleanup_error
+
+    def __str__(self):
+        return f"{type(self).__name__}(build={json.dumps(self.params, sort_keys=True)},query={json.dumps(self.query_params, sort_keys=True)})"
+
+
+class _RaBitQ(OpenGaussANN):
+    def _validate_rabitq(self):
+        if not boolean("enable_rabitq", self.params["enable_rabitq"]):
+            raise ValueError("RaBitQ adapters require enable_rabitq=true")
+        boolean("rabitq_fht", self.params["rabitq_fht"])
+        value = self.params["rabitq_refine_type"]
+        if not isinstance(value, str) or value.upper() not in ("FP32", "SQ8", "NONE"):
+            raise ValueError("rabitq_refine_type must be FP32, SQ8, or NONE")
+        self.params["rabitq_refine_type"] = value.upper()
+
+    def _rabitq_options(self):
+        return {key: self.params[key] for key in ("enable_rabitq", "rabitq_refine_type", "rabitq_fht")}
+
+    def _validate_rabitq_query(self, params):
+        params["rbq_query_bits"] = integer("rbq_query_bits", params["rbq_query_bits"], 1, 8)
+        # Source/pg_settings in 7.0.0 accepts real 0..1000 (some docs state 1..1000).
+        params["rbq_refinek"] = real("rbq_refinek", params["rbq_refinek"], 0, 1000)
+
+
+RABITQ_DEFAULTS = {"enable_rabitq": True, "rabitq_refine_type": "FP32", "rabitq_fht": False}
+
+
+class OpenGaussHNSWRaBitQ(_RaBitQ):
+    method = "hnsw"
+    defaults = {"m": 16, "ef_construction": 64, **RABITQ_DEFAULTS}
+    query_defaults = {"hnsw_ef_search": 100, "rbq_query_bits": 8, "rbq_refinek": 5.0}
+
+    def _validate_build(self):
+        self.params["m"] = integer("m", self.params["m"], 2, 100)
+        self.params["ef_construction"] = integer("ef_construction", self.params["ef_construction"], 4, 1000)
+        if self.params["ef_construction"] < 2 * self.params["m"]:
+            raise ValueError("ef_construction must be at least 2*m")
+        self._validate_rabitq()
+
+    def _index_options(self):
+        return {"m": self.params["m"], "ef_construction": self.params["ef_construction"], **self._rabitq_options()}
+
+    def _validate_query(self, params):
+        params["hnsw_ef_search"] = integer("hnsw_ef_search", params["hnsw_ef_search"], 1, 1000000)
+        self._validate_rabitq_query(params)
+
+
+class OpenGaussIVFFlatRaBitQ(_RaBitQ):
+    method = "ivfflat"
+    defaults = {"lists": 100, **RABITQ_DEFAULTS}
+    query_defaults = {"ivfflat_probes": 10, "rbq_query_bits": 8, "rbq_refinek": 5.0}
+
+    def _validate_build(self):
+        self.params["lists"] = integer("lists", self.params["lists"], 1, 32768)
+        self._validate_rabitq()
+
+    def _index_options(self):
+        return {"lists": self.params["lists"], **self._rabitq_options()}
+
+    def _validate_query(self, params):
+        params["ivfflat_probes"] = integer("ivfflat_probes", params["ivfflat_probes"], 1, 32768)
+        if params["ivfflat_probes"] > self.params["lists"]:
+            raise ValueError("ivfflat_probes must not exceed lists")
+        self._validate_rabitq_query(params)
+
+
+class OpenGaussDiskANN(OpenGaussANN):
+    method = "diskann"
+    max_dimension = 1536
+    defaults = {"index_size": 100, "enable_pq": False, "pq_m": 8}
+    query_defaults = {"diskann_probes": 128}
+
+    def _validate_build(self):
+        self.params["index_size"] = integer("index_size", self.params["index_size"], 16, 1000)
+        self.params["pq_m"] = integer("pq_m", self.params["pq_m"], 1, 192)
+        boolean("enable_pq", self.params["enable_pq"])
+
+    def _index_options(self):
+        return {key: self.params[key] for key in ("index_size", "enable_pq", "pq_m")}
+
+    def _validate_query(self, params):
+        params["diskann_probes"] = integer("diskann_probes", params["diskann_probes"], 1, 32768)
+
 
 class openGaussHNSWPQ(BaseANN):
     def __init__(self, metric, method_param):
